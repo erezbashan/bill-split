@@ -1,0 +1,217 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// This security rules file assumes the following data structures:
+//
+// Collection: bills
+// Document ID: {billId} (6-character capability token, e.g. "k9m3x2")
+// Fields:
+//   - id: string (required, immutable, must equal billId, max 32 chars) - Unique bill identifier
+//   - restaurantName: string (required, 1..200 chars) - Name of the restaurant
+//   - createdAt: number (required, immutable, > 0) - Creation epoch timestamp in ms
+//   - expiresAt: number (required, > 0) - Expiration epoch timestamp in ms (24h TTL)
+//   - expiresAtTimestamp: timestamp (optional) - Firestore TTL timestamp
+//   - phase: string (required, enum: ['selecting', 'settled']) - Current bill splitting phase
+//   - items: list (required, max 300 elements) - Array of bill line items
+//   - participants: list (required, max 100 elements) - Array of table participants
+//   - discountAmount: number (required, >= 0) - Total discount in ILS
+//   - extraFeeAmount: number (required, >= 0) - Additional fee (e.g. security/delivery) in ILS
+//   - extraFeeLabel: string (optional, max 100 chars) - Label for the extra fee
+//   - receiptTotal: number (required, >= 0) - Printed total on the receipt before tip
+//   - tipMode: string (required, enum: ['percent', 'amount']) - How tip is calculated
+//   - tipPercent: number (required, >= 0, <= 100) - Tip percentage
+//   - tipCustomAmount: number (required, >= 0) - Fixed custom tip amount
+//   - hasReceiptImage: bool (required) - Whether a compressed receipt photo exists in subcollection
+//   - payerName: string (optional, max 100 chars) - Name of person who paid the bill
+//   - payerPhone: string (optional, max 50 chars) - Phone number for Bit/PayBox transfer
+//
+// Subcollection: bills/{billId}/media
+// Document ID: {mediaId} (must be "receipt")
+// Fields:
+//   - dataUrl: string (required, 1..599999 chars) - Compressed base64 data URL of receipt image
+//   - createdAt: number (optional, > 0) - Creation epoch timestamp in ms
+//   - expiresAtTimestamp: timestamp (optional) - Firestore TTL timestamp
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == resource.data.uid;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function validStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    function isValidOptionalString(field, minLen, maxLen) {
+      return !(field in request.resource.data) ||
+        (request.resource.data[field] is string &&
+         request.resource.data[field].size() >= minLen &&
+         request.resource.data[field].size() <= maxLen);
+    }
+
+    function isValidList(listData, maxSize) {
+      return listData is list && listData.size() <= maxSize;
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidBillId(billId) {
+      return billId is string && billId.size() >= 4 && billId.size() <= 32;
+    }
+
+    function isValidBill(data, billId) {
+      let requiredFields = [
+        'id',
+        'restaurantName',
+        'createdAt',
+        'expiresAt',
+        'phase',
+        'items',
+        'participants',
+        'discountAmount',
+        'extraFeeAmount',
+        'receiptTotal',
+        'tipMode',
+        'tipPercent',
+        'tipCustomAmount',
+        'hasReceiptImage'
+      ];
+      let allowedFields = [
+        'id',
+        'restaurantName',
+        'createdAt',
+        'expiresAt',
+        'expiresAtTimestamp',
+        'phase',
+        'items',
+        'participants',
+        'discountAmount',
+        'extraFeeAmount',
+        'extraFeeLabel',
+        'receiptTotal',
+        'tipMode',
+        'tipPercent',
+        'tipCustomAmount',
+        'hasReceiptImage',
+        'payerName',
+        'payerPhone'
+      ];
+
+      return hasRequiredFields(requiredFields) &&
+        hasOnlyAllowedFields(allowedFields) &&
+        isValidBillId(billId) &&
+        data.id == billId &&
+        validStringLength('restaurantName', 1, 200) &&
+        data.createdAt is number && data.createdAt > 0 &&
+        data.expiresAt is number && data.expiresAt >= data.createdAt &&
+        (!('expiresAtTimestamp' in data) || data.expiresAtTimestamp is timestamp) &&
+        data.phase in ['selecting', 'settled'] &&
+        isValidList(data.items, 300) &&
+        isValidList(data.participants, 100) &&
+        data.discountAmount is number && data.discountAmount >= 0 && data.discountAmount <= 1000000 &&
+        data.extraFeeAmount is number && data.extraFeeAmount >= 0 && data.extraFeeAmount <= 1000000 &&
+        isValidOptionalString('extraFeeLabel', 0, 100) &&
+        data.receiptTotal is number && data.receiptTotal >= 0 && data.receiptTotal <= 1000000 &&
+        data.tipMode in ['percent', 'amount'] &&
+        data.tipPercent is number && data.tipPercent >= 0 && data.tipPercent <= 100 &&
+        data.tipCustomAmount is number && data.tipCustomAmount >= 0 && data.tipCustomAmount <= 1000000 &&
+        data.hasReceiptImage is bool &&
+        isValidOptionalString('payerName', 0, 100) &&
+        isValidOptionalString('payerPhone', 0, 50);
+    }
+
+    function isValidReceiptMedia(data, mediaId) {
+      let requiredFields = ['dataUrl'];
+      let allowedFields = ['dataUrl', 'createdAt', 'expiresAtTimestamp'];
+
+      return mediaId == 'receipt' &&
+        hasRequiredFields(requiredFields) &&
+        hasOnlyAllowedFields(allowedFields) &&
+        data.dataUrl is string &&
+        data.dataUrl.size() > 0 &&
+        data.dataUrl.size() < 600000 &&
+        (!('createdAt' in data) || (data.createdAt is number && data.createdAt > 0)) &&
+        (!('expiresAtTimestamp' in data) || data.expiresAtTimestamp is timestamp);
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    match /bills/{billId} {
+      // Capability-link access: anyone with the exact billId link can fetch the bill,
+      // but listing/enumerating the bills collection is strictly forbidden.
+      allow get: if isValidBillId(billId);
+      allow list: if false;
+
+      allow create: if isValidBill(request.resource.data, billId);
+      allow update: if isValidBill(request.resource.data, billId) &&
+        areImmutableFieldsUnchanged(['id', 'createdAt']);
+
+      // Client deletion is disallowed; expiration is managed via TTL policy.
+      allow delete: if false;
+
+      match /media/{mediaId} {
+        allow get: if isValidBillId(billId) && mediaId == 'receipt';
+        allow list: if false;
+
+        allow create: if isValidBillId(billId) &&
+          isValidReceiptMedia(request.resource.data, mediaId);
+        allow update: if isValidBillId(billId) &&
+          isValidReceiptMedia(request.resource.data, mediaId) &&
+          areImmutableFieldsUnchanged(['createdAt']);
+
+        allow delete: if false;
+      }
+    }
+
+    // Default deny all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

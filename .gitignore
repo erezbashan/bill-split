@@ -1,0 +1,12 @@
+node_modules
+dist
+.vite
+.cache
+.firebase
+.env
+.env.local
+.env.production
+.local-dev-bills.json
+tsconfig.tsbuildinfo
+.DS_Store
+scripts/scratch/
